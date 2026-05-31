@@ -4,8 +4,12 @@ const axios = require("axios");
 const cors = require("cors");
 const admin = require("firebase-admin");
 
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "10mb" }));
+
 // =====================================================
-// FIREBASE INITIALIZATION
+// FIREBASE
 // =====================================================
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
@@ -15,12 +19,8 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: "10mb" }));
-
 // =====================================================
-// GEMINI API KEY ROTATOR
+// GEMINI KEY ROTATOR
 // =====================================================
 const API_KEYS = [
     process.env.GEMINI_API_KEY_1,
@@ -36,16 +36,14 @@ const API_KEYS = [
 let keyIndex = 0;
 
 function getNextKey() {
-    if (!API_KEYS.length) {
-        throw new Error("No Gemini API Keys Found");
-    }
-
     const key = API_KEYS[keyIndex];
     keyIndex = (keyIndex + 1) % API_KEYS.length;
-
     return key;
 }
 
+// =====================================================
+// GEMINI CALL (TEXT + IMAGE SUPPORT)
+// =====================================================
 async function callGemini(contents) {
     let lastError;
 
@@ -57,56 +55,42 @@ async function callGemini(contents) {
                 `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`,
                 { contents },
                 {
-                    timeout: 45000,
-                    headers: {
-                        "Content-Type": "application/json"
-                    }
+                    headers: { "Content-Type": "application/json" },
+                    timeout: 45000
                 }
             );
 
             const text =
                 response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
 
-            if (text) {
-                return text.trim();
-            }
+            if (text) return text.trim();
+
         } catch (err) {
-            console.error(`Gemini key failed: ${key.slice(0, 8)}...`);
             lastError = err;
+            console.error("Gemini key failed:", key.slice(0, 8));
         }
     }
 
     throw new Error(
         lastError?.response?.data?.error?.message ||
         lastError?.message ||
-        "Gemini request failed"
+        "Gemini failed"
     );
 }
 
 // =====================================================
-// OPTIONAL AUTH MIDDLEWARE
+// OPTIONAL AUTH
 // =====================================================
-// Guests are allowed.
-// Logged-in users get memory.
 const optionalAuth = async (req, res, next) => {
     req.user = null;
 
-    const authHeader = req.headers.authorization;
-
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-        return next();
-    }
+    const header = req.headers.authorization;
+    if (!header?.startsWith("Bearer ")) return next();
 
     try {
-        const token = authHeader.split("Bearer ")[1];
-
-        const decoded = await admin
-            .auth()
-            .verifyIdToken(token);
-
-        req.user = decoded;
-    } catch (err) {
-        console.log("Invalid token. Continuing as guest.");
+        const token = header.split("Bearer ")[1];
+        req.user = await admin.auth().verifyIdToken(token);
+    } catch {
         req.user = null;
     }
 
@@ -114,123 +98,125 @@ const optionalAuth = async (req, res, next) => {
 };
 
 // =====================================================
-// HEALTH CHECK
-// =====================================================
-app.get("/", (req, res) => {
-    res.json({
-        status: "online",
-        service: "JARVIS CORE",
-        mode: "Guest + Auth Users Supported"
-    });
-});
-
-// =====================================================
-// CHAT ROUTE
+// CHAT ROUTE (UPDATED FOR CLOUDINARY + VISION)
 // =====================================================
 app.post("/chat", optionalAuth, async (req, res) => {
     try {
-        const prompt = req.body?.prompt;
+        const {
+            prompt = "",
+            attachmentUrl,
+            attachmentType
+        } = req.body;
 
-        if (!prompt || !prompt.trim()) {
+        if (!prompt && !attachmentUrl) {
             return res.status(400).json({
-                error: "Prompt is required"
+                error: "Prompt or attachment required"
             });
         }
 
-        // ============================================
-        // GUEST MODE
-        // ============================================
-        if (!req.user) {
-            const reply = await callGemini([
-                {
+        // =====================================================
+        // BUILD GEMINI CONTENT
+        // =====================================================
+        const parts = [];
+
+        // text
+        if (prompt.trim()) {
+            parts.push({ text: prompt });
+        }
+
+        // image OR file from cloudinary
+        if (attachmentUrl) {
+
+            // IMAGE (Vision AI)
+            if (attachmentType?.startsWith("image/")) {
+                parts.push({
+                    fileData: {
+                        fileUri: attachmentUrl,
+                        mimeType: attachmentType
+                    }
+                });
+            }
+
+            // NON-IMAGE FILES (PDF, DOCX, TXT fallback)
+            else {
+                parts.push({
+                    text: `File attached: ${attachmentUrl}`
+                });
+            }
+        }
+
+        // =====================================================
+        // FIRESTORE MEMORY (AUTH USERS ONLY)
+        // =====================================================
+        if (req.user) {
+            const uid = req.user.uid;
+
+            const chatRef = db
+                .collection("users")
+                .doc(uid)
+                .collection("history");
+
+            const snapshot = await chatRef
+                .orderBy("timestamp", "asc")
+                .limitToLast(10)
+                .get();
+
+            const history = [];
+
+            snapshot.forEach(doc => {
+                const data = doc.data();
+                if (data.content) history.push(data.content);
+            });
+
+            history.push({
+                role: "user",
+                parts
+            });
+
+            const reply = await callGemini(history);
+
+            await chatRef.add({
+                content: {
                     role: "user",
-                    parts: [
-                        {
-                            text: prompt
-                        }
-                    ]
-                }
-            ]);
+                    parts
+                },
+                timestamp: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            await chatRef.add({
+                content: {
+                    role: "model",
+                    parts: [{ text: reply }]
+                },
+                timestamp: admin.firestore.FieldValue.serverTimestamp()
+            });
 
             return res.json({
                 reply,
-                guest: true,
-                memory: false
+                memory: true
             });
         }
 
-        // ============================================
-        // AUTHENTICATED USER MODE
-        // ============================================
-        const uid = req.user.uid;
-
-        const chatRef = db
-            .collection("users")
-            .doc(uid)
-            .collection("history");
-
-        const snapshot = await chatRef
-            .orderBy("timestamp", "asc")
-            .limitToLast(10)
-            .get();
-
-        const history = [];
-
-        snapshot.forEach(doc => {
-            const data = doc.data();
-
-            if (data.content) {
-                history.push(data.content);
-            }
-        });
-
-        history.push({
-            role: "user",
-            parts: [
-                {
-                    text: prompt
-                }
-            ]
-        });
-
-        const reply = await callGemini(history);
-
-        await chatRef.add({
-            content: {
+        // =====================================================
+        // GUEST MODE
+        // =====================================================
+        const reply = await callGemini([
+            {
                 role: "user",
-                parts: [
-                    {
-                        text: prompt
-                    }
-                ]
-            },
-            timestamp: admin.firestore.FieldValue.serverTimestamp()
-        });
-
-        await chatRef.add({
-            content: {
-                role: "model",
-                parts: [
-                    {
-                        text: reply
-                    }
-                ]
-            },
-            timestamp: admin.firestore.FieldValue.serverTimestamp()
-        });
+                parts
+            }
+        ]);
 
         return res.json({
             reply,
-            guest: false,
-            memory: true,
-            uid
+            memory: false
         });
 
     } catch (err) {
         console.error("CHAT ERROR:", err);
 
         return res.status(500).json({
-            error: "AI Processing Failed",
+            error: "AI failed",
             details:
                 process.env.NODE_ENV === "development"
                     ? err.message
@@ -240,10 +226,10 @@ app.post("/chat", optionalAuth, async (req, res) => {
 });
 
 // =====================================================
-// START SERVER
+// SERVER START
 // =====================================================
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`🚀 JARVIS CORE running on port ${PORT}`);
+    console.log("🚀 JARVIS CORE running on port", PORT);
 });
