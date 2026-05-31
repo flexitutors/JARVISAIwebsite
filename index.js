@@ -42,7 +42,7 @@ function getNextKey() {
 }
 
 // =====================================================
-// GEMINI CALL (TEXT + IMAGE SUPPORT)
+// GEMINI CALL
 // =====================================================
 async function callGemini(contents) {
     let lastError;
@@ -98,7 +98,32 @@ const optionalAuth = async (req, res, next) => {
 };
 
 // =====================================================
-// CHAT ROUTE (UPDATED FOR CLOUDINARY + VISION)
+// UNICODE + CLEAN OUTPUT MODE (IMPORTANT)
+// =====================================================
+function buildSystemPrompt(prompt) {
+    return `
+You are JARVIS.
+
+STRICT RULES:
+- Do NOT use LaTeX ($ or $$)
+- Do NOT use markdown (** or __)
+- Use clean readable text only
+- Use Unicode math symbols when needed:
+  √ π ± × ÷ ∫ ∑ ∞ ² ³
+
+STYLE:
+- Simple
+- Educational
+- WhatsApp-style responses
+- No formatting noise
+
+User:
+${prompt}
+`;
+}
+
+// =====================================================
+// CHAT ROUTE
 // =====================================================
 app.post("/chat", optionalAuth, async (req, res) => {
     try {
@@ -114,20 +139,18 @@ app.post("/chat", optionalAuth, async (req, res) => {
             });
         }
 
-        // =====================================================
-        // BUILD GEMINI CONTENT
-        // =====================================================
         const parts = [];
 
-        // text
+        // TEXT (wrapped in strict system rules)
         if (prompt.trim()) {
-            parts.push({ text: prompt });
+            parts.push({
+                text: buildSystemPrompt(prompt)
+            });
         }
 
-        // image OR file from cloudinary
+        // IMAGE SUPPORT (Cloudinary)
         if (attachmentUrl) {
 
-            // IMAGE (Vision AI)
             if (attachmentType?.startsWith("image/")) {
                 parts.push({
                     fileData: {
@@ -135,10 +158,7 @@ app.post("/chat", optionalAuth, async (req, res) => {
                         mimeType: attachmentType
                     }
                 });
-            }
-
-            // NON-IMAGE FILES (PDF, DOCX, TXT fallback)
-            else {
+            } else {
                 parts.push({
                     text: `File attached: ${attachmentUrl}`
                 });
@@ -146,7 +166,7 @@ app.post("/chat", optionalAuth, async (req, res) => {
         }
 
         // =====================================================
-        // FIRESTORE MEMORY (AUTH USERS ONLY)
+        // FIRESTORE MEMORY (AUTH USERS)
         // =====================================================
         if (req.user) {
             const uid = req.user.uid;
@@ -173,7 +193,7 @@ app.post("/chat", optionalAuth, async (req, res) => {
                 parts
             });
 
-            const reply = await callGemini(history);
+            let reply = await callGemini(history);
 
             await chatRef.add({
                 content: {
@@ -200,7 +220,7 @@ app.post("/chat", optionalAuth, async (req, res) => {
         // =====================================================
         // GUEST MODE
         // =====================================================
-        const reply = await callGemini([
+        let reply = await callGemini([
             {
                 role: "user",
                 parts
